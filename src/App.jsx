@@ -1,12 +1,4 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { auth, db } from './firebase';
-import { 
-  onAuthStateChanged, 
-  signInWithEmailAndPassword, 
-  createUserWithEmailAndPassword, 
-  signOut 
-} from 'firebase/auth';
-import { doc, getDoc, setDoc } from 'firebase/firestore';
 
 // 初始默认演示数据
 const defaultSkus = [
@@ -50,17 +42,20 @@ export default function App() {
   const [recycleBin, setRecycleBin] = useState(() => JSON.parse(localStorage.getItem('crm_recycle_bin')) || []);
   const [currentTab, setCurrentTab] = useState('home'); // home, clients, backup
   
-  // 基础公用名称
+  // 基础文档设定
   const [companyName, setCompanyName] = useState(() => localStorage.getItem('crm_comp_name') || '消防器材智能设备有限公司');
   const [creatorName, setCreatorName] = useState(() => localStorage.getItem('crm_creator') || '张三');
 
-  // ---- 2. Firebase 安全及记忆锁状态 ----
-  const [user, setUser] = useState(null);
-  const [isAuthLoading, setIsAuthLoading] = useState(true);
-  const [databaseReady, setDatabaseReady] = useState(false); // 写入锁
-  const [isCloudSyncing, setIsCloudSyncing] = useState(false);
+  // ---- 2. 本地账号系统 ----
+  const [user, setUser] = useState(() => localStorage.getItem('crm_current_user') || null);
+  const [isAuthLoading, setIsAuthLoading] = useState(false);
   const [googleSheetUrl, setGoogleSheetUrl] = useState(() => localStorage.getItem('crm_gsheet_url') || '');
   const [lastSyncTime, setLastSyncTime] = useState(() => localStorage.getItem('crm_last_sync') || '本地离线存储');
+
+  // 辅助函数：读取所有本地账号
+  const getAccounts = () => JSON.parse(localStorage.getItem('crm_accounts') || '{}');
+  const saveAccounts = (accs) => localStorage.setItem('crm_accounts', JSON.stringify(accs));
+  const simpleHash = (s) => btoa(s + 'fire_crm_salt_2024').slice(0, 32);
   
   // 账户登录控制
   const [showAuthModal, setShowAuthModal] = useState(false);
@@ -79,7 +74,7 @@ export default function App() {
   const [showRecycleBin, setShowRecycleBin] = useState(false);
   const [notification, setNotification] = useState(null);
 
-  // ---- 4. 单据开单浮层及编辑状态 ----
+  // ---- 4. 单据开单编辑状态 ----
   const [showCreateDocMenu, setShowCreateDocMenu] = useState(false);
   const [activeDocType, setActiveDocType] = useState(null); // null, 'sales', 'quote', 'contract_vat', 'contract_normal'
   const [activeClientName, setActiveClientName] = useState('');
@@ -91,58 +86,55 @@ export default function App() {
   const [showAddClientModal, setShowAddClientModal] = useState(false);
 
   // ==========================================
-  // 🛡️ 底层防御：登录状态监听与【账号URL记忆拉取】
+  // 🚨 核心数据导出方法（提前至顶部，安全无警告）
   // ==========================================
+  const handleExportData = () => {
+    const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify({ skus, clients, recycleBin }));
+    const downloadAnchor = document.createElement('a');
+    downloadAnchor.setAttribute("href", dataStr);
+    downloadAnchor.setAttribute("download", "fire_crm_backup_" + new Date().toISOString().slice(0,10) + ".json");
+    document.body.appendChild(downloadAnchor);
+    downloadAnchor.click();
+    downloadAnchor.remove();
+    showToast("备份已安全导出到本地");
+  };
+
+  // ==========================================
+  // 🚨 核心检索建议变量
+  // ==========================================
+  const filteredSkus = useMemo(() => {
+    if (!searchQuery) return skus;
+    return skus.filter(sku => 
+      sku.name.includes(searchQuery) || 
+      (sku.brand && sku.brand.includes(searchQuery)) ||
+      (sku.model && sku.model.includes(searchQuery))
+    );
+  }, [skus, searchQuery]);
+
+  // ==========================================
+  // 🛡️ 本地账号：登录后自动载入账号绑定的 Google Sheet URL
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
-      setUser(currentUser);
-      setIsAuthLoading(false);
+    if (!user) return;
+    const accounts = getAccounts();
+    const account = accounts[user];
+    if (account && account.googleSheetUrl) {
+      setGoogleSheetUrl(account.googleSheetUrl);
+      localStorage.setItem('crm_gsheet_url', account.googleSheetUrl);
+    }
+  }, [user]);
 
-      if (currentUser) {
-        setIsCloudSyncing(true);
-        try {
-          setDatabaseReady(false); // 闭锁
-
-          // 从 Firestore 读取该用户云端配置，自动“记忆” Google Sheet 链接
-          const docRef = doc(db, "users", currentUser.uid);
-          const docSnap = await getDoc(docRef);
-
-          if (docSnap.exists()) {
-            const cloudConfig = docSnap.data();
-            if (cloudConfig.googleSheetUrl) {
-              setGoogleSheetUrl(cloudConfig.googleSheetUrl);
-              localStorage.setItem('crm_gsheet_url', cloudConfig.googleSheetUrl);
-            }
-            showToast("成功同步云端账号配置");
-          }
-        } catch (error) {
-          showToast("云端记忆拉取失败: " + error.message);
-        } finally {
-          setIsCloudSyncing(false);
-          setDatabaseReady(true); // 开锁
-        }
-      } else {
-        setDatabaseReady(false);
-      }
-    });
-
-    return () => unsubscribe();
-  }, []);
-
-  // 当 Google Sheet 变更时，如果处于登录状态，自动在云端记住这个配置
+  // 当 Google Sheet URL 变更且已登录时，自动记住到当前账号
   useEffect(() => {
-    if (!user || !databaseReady) return;
-    const saveConfigToCloud = async () => {
-      try {
-        const docRef = doc(db, "users", user.uid);
-        await setDoc(docRef, { googleSheetUrl }, { merge: true });
-      } catch (e) {
-        console.error("无法保存云端配置: ", e);
+    if (!user || !googleSheetUrl) return;
+    const timer = setTimeout(() => {
+      const accounts = getAccounts();
+      if (accounts[user]) {
+        accounts[user].googleSheetUrl = googleSheetUrl;
+        saveAccounts(accounts);
       }
-    };
-    const timer = setTimeout(saveConfigToCloud, 2000);
+    }, 1000);
     return () => clearTimeout(timer);
-  }, [googleSheetUrl, user, databaseReady]);
+  }, [googleSheetUrl, user]);
 
   // 本地缓存备份双重安全保障
   useEffect(() => {
@@ -192,7 +184,7 @@ export default function App() {
       .then(res => res.json())
       .then(data => {
         if (data.status === 'success') {
-          if (confirm(`下载成功！\n云端发现产品: ${data.skus?.length || 0} 个\n云端发现客户: ${data.clients?.length || 0} 位\n\n确认覆盖并恢复至当前设备本地吗？`)) {
+          if (confirm("下载成功！\n云端发现产品: " + (data.skus?.length || 0) + " 个\n云端发现客户: " + (data.clients?.length || 0) + " 位\n\n确认覆盖并恢复至当前设备本地吗？")) {
             if (data.skus) setSkus(data.skus);
             if (data.clients) setClients(data.clients);
             const now = new Date().toLocaleString();
@@ -218,12 +210,10 @@ export default function App() {
     setShowCreateDocMenu(false);
   };
 
-  // 添加物料至单据（如果不存在则新增 SKU 并分配客户价）
   const handleAddSkuToDoc = (skuId) => {
     const targetSku = skus.find(s => s.id === skuId);
     if (!targetSku) return;
 
-    // 默认寻找客户对应的专属售价，若无则默认为 0
     const clientObj = clients.find(c => c.name === activeClientName);
     const savedPrice = clientObj?.skuPrices?.[skuId] || 0;
 
@@ -234,7 +224,6 @@ export default function App() {
     }]);
   };
 
-  // 专属价格保存逻辑：每次新增或修改销售单中的产品价格，自动同步到客户子售价中，并不修改原生SKU进价
   const handleDocPriceChange = (index, newPrice) => {
     const updated = [...activeItems];
     updated[index].price = Number(newPrice) || 0;
@@ -242,7 +231,6 @@ export default function App() {
 
     const currentItem = updated[index];
     if (activeClientName) {
-      // 如果客户不存在，自动创建该客户
       const clientExists = clients.some(c => c.name === activeClientName);
       if (!clientExists) {
         const newC = {
@@ -254,7 +242,6 @@ export default function App() {
         };
         setClients([newC, ...clients]);
       } else {
-        // 存在则更新专属价
         setClients(prev => prev.map(c => {
           if (c.name === activeClientName) {
             return {
@@ -278,7 +265,7 @@ export default function App() {
       updatedAt: new Date().toLocaleString()
     };
     setSkus([skuWithId, ...skus]);
-    showToast(`产品 ${newSku.name} 已入库`);
+    showToast("产品 " + newSku.name + " 已入库");
   };
 
   const handleEditSku = (updatedSku) => {
@@ -291,7 +278,7 @@ export default function App() {
     if (target) {
       setRecycleBin([...recycleBin, { type: 'sku', data: target, deletedAt: new Date().toLocaleString() }]);
       setSkus(skus.filter(item => item.id !== skuId));
-      showToast(`产品 "${target.name}" 已移入回收站`);
+      showToast("产品 \"" + target.name + "\" 已移入回收站");
     }
   };
 
@@ -303,7 +290,7 @@ export default function App() {
       updatedAt: new Date().toLocaleString()
     };
     setClients([clientWithId, ...clients]);
-    showToast(`客户 ${newC.name} 录入成功`);
+    showToast("客户 " + newC.name + " 录入成功");
   };
 
   const handleEditClient = (updatedC) => {
@@ -311,109 +298,75 @@ export default function App() {
     showToast("客户工商信息修改成功");
   };
 
-  const handleExportData = () => {
-    const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify({ skus, clients, recycleBin }));
-    const downloadAnchor = document.createElement('a');
-    downloadAnchor.setAttribute("href", dataStr);
-    downloadAnchor.setAttribute("download", `fire_crm_local_backup_${new Date().toISOString().slice(0,10)}.json`);
-    document.body.appendChild(downloadAnchor);
-    downloadAnchor.click();
-    downloadAnchor.remove();
-    showToast("本地数据导出成功");
-  };
-
-  const handleCsvImport = (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const text = event.target.result;
-      const lines = text.split('\n');
-      const newSkusList = [];
-      const startIdx = (lines[0].includes('名称') || lines[0].includes('品名') || lines[0].includes('name')) ? 1 : 0;
-      
-      for (let i = startIdx; i < lines.length; i++) {
-        const line = lines[i].trim();
-        if (!line) continue;
-        const cols = line.split(',').map(col => col.trim().replace(/^["']|["']$/g, ''));
-        if (cols[0]) {
-          newSkusList.push({
-            id: (Date.now() + i).toString(),
-            name: cols[0],
-            price: Number(cols[1]) || 0,
-            brand: cols[2] || '',
-            model: cols[3] || '',
-            unit: cols[4] || '个',
-            note: cols[5] || '',
-            updatedAt: new Date().toLocaleString()
-          });
-        }
-      }
-
-      if (newSkusList.length > 0) {
-        setSkus(prev => [...newSkusList, ...prev]);
-        showToast(`成功导入 ${newSkusList.length} 个 SKU`);
-        setShowAddSkuModal(false);
-      } else {
-        showToast("未读取到可用物料数据");
-      }
-    };
-    reader.readAsText(file, 'UTF-8');
-  };
-
-  const handleBatchTextImport = () => {
-    if (!batchPasteText.trim()) return;
-    const lines = batchPasteText.split('\n');
-    const newSkusList = [];
-
-    lines.forEach((line, idx) => {
-      const trimmedLine = line.trim();
-      if (!trimmedLine) return;
-      const delimiter = trimmedLine.includes('\t') ? '\t' : ',';
-      const cols = trimmedLine.split(delimiter).map(col => col.trim());
-
-      if (cols[0]) {
-        newSkusList.push({
-          id: (Date.now() + idx).toString(),
-          name: cols[0],
-          price: Number(cols[1]) || 0,
-          brand: cols[2] || '',
-          model: cols[3] || '',
-          unit: cols[4] || '个',
-          note: cols[5] || '',
-          updatedAt: new Date().toLocaleString()
-        });
-      }
-    });
-
-    if (newSkusList.length > 0) {
-      setSkus(prev => [...newSkusList, ...prev]);
-      showToast(`成功批量导入 ${newSkusList.length} 个 SKU`);
-      setBatchPasteText('');
-      setShowAddSkuModal(false);
-    } else {
-      showToast("解析失败");
+  const handleDeleteClient = (clientId) => {
+    const target = clients.find(item => item.id !== clientId);
+    if (target) {
+      setRecycleBin([...recycleBin, { type: 'client', data: target, deletedAt: new Date().toLocaleString() }]);
+      setClients(clients.filter(item => item.id !== clientId));
+      showToast("已将客户 \"" + target.name + "\" 移至回收站");
     }
   };
 
-  const handleAuthSubmit = async (e) => {
+  const handleRestore = (index) => {
+    const item = recycleBin[index];
+    if (item.type === 'sku') {
+      setSkus([item.data, ...skus]);
+    } else if (item.type === 'client') {
+      setClients([item.data, ...clients]);
+    }
+    const updatedBin = [...recycleBin];
+    updatedBin.splice(index, 1);
+    setRecycleBin(updatedBin);
+    showToast("数据已成功拉回");
+  };
+
+  const handleAuthSubmit = (e) => {
     e.preventDefault();
-    if (!authEmail || !authPassword) return;
-    setIsCloudSyncing(true);
-    try {
-      if (isSignUp) {
-        await createUserWithEmailAndPassword(auth, authEmail, authPassword);
-        showToast("注册成功！云端配置已分配");
-      } else {
-        await signInWithEmailAndPassword(auth, authEmail, authPassword);
-        showToast("登录成功，链接已拉取并记忆");
+    if (!authEmail || !authPassword || authPassword.length < 6) {
+      showToast("密码不能少于6位");
+      return;
+    }
+    const accounts = getAccounts();
+    if (isSignUp) {
+      if (accounts[authEmail]) {
+        showToast("该账号已存在，请直接登录");
+        return;
       }
-      setShowAuthModal(false);
-    } catch (err) {
-      showToast("验证失败: " + err.message);
-    } finally {
-      setIsCloudSyncing(false);
+      accounts[authEmail] = { passwordHash: simpleHash(authPassword), googleSheetUrl: '' };
+      saveAccounts(accounts);
+      setUser(authEmail);
+      localStorage.setItem('crm_current_user', authEmail);
+      showToast("注册成功！账号已创建");
+    } else {
+      const account = accounts[authEmail];
+      if (!account) {
+        showToast("账号不存在，请先注册");
+        return;
+      }
+      if (account.passwordHash !== simpleHash(authPassword)) {
+        showToast("密码错误");
+        return;
+      }
+      setUser(authEmail);
+      localStorage.setItem('crm_current_user', authEmail);
+      showToast("登录成功，已载入您的备份配置");
+    }
+    setShowAuthModal(false);
+  };
+
+  const handleSelectClientForDoc = (clientName) => {
+    setActiveClientName(clientName);
+    const clientExists = clients.some(c => c.name === clientName);
+    if (clientName && !clientExists) {
+      const newClient = {
+        id: 'c_' + Date.now(),
+        name: clientName,
+        contact: '默认联系人',
+        skuPrices: {},
+        updatedAt: new Date().toLocaleString()
+      };
+      setClients([...clients, newClient]);
+      showToast("已自动将新客户 \"" + clientName + "\" 登记入库");
     }
   };
 
@@ -428,11 +381,12 @@ export default function App() {
         <div className="flex items-center space-x-2">
           {/* 全局账号入口 */}
           <button 
+            type="button"
             onClick={() => setShowAuthModal(true)} 
             className="p-1.5 rounded-full bg-slate-100 hover:bg-slate-200 active:scale-95 transition-all text-sm flex items-center space-x-1.5 px-3"
           >
             <span>👤</span>
-            <span className="text-xs font-semibold text-slate-600">{user ? user.email.split('@')[0] : '登录账号'}</span>
+            <span className="text-xs font-semibold text-slate-600">{user ? user.split('@')[0] : '登录账号'}</span>
           </button>
         </div>
       </header>
@@ -440,13 +394,19 @@ export default function App() {
       {/* 2. 主页面渲染区 */}
       <main className="flex-1 p-4 max-w-4xl mx-auto w-full">
         
-        {/* TAB 1: 首页 (SKU 库 + 聚合开单中心) */}
+        {/* TAB 1: 首页 (SKU 库 + 智能业务开单中心) */}
         {currentTab === 'home' && !activeDocType && (
           <div className="space-y-4 no-print">
             
-            {/* 开单聚合中心按钮 */}
-            <div className="bg-gradient-to-r from-red-500 to-rose-600 rounded-3xl p-6 text-white shadow-xl shadow-red-100 relative overflow-hidden">
-              <div className="absolute right-0 bottom-0 translate-x-4 translate-y-4 opacity-15 text-9xl">📋</div>
+            {/* 智能业务开单中心 */}
+            <div className="bg-gradient-to-r from-red-500 to-rose-600 rounded-3xl p-6 text-white shadow-xl shadow-red-100 relative">
+              
+              {/* 背景剪裁遮罩 */}
+              <div className="absolute inset-0 rounded-3xl overflow-hidden pointer-events-none">
+                <div className="absolute right-0 bottom-0 translate-x-4 translate-y-4 opacity-15 text-9xl">📋</div>
+              </div>
+
+              {/* 核心内容区 */}
               <div className="relative z-10 space-y-4">
                 <div>
                   <h3 className="font-bold text-lg">智能业务开单中心</h3>
@@ -454,6 +414,7 @@ export default function App() {
                 </div>
                 <div className="relative inline-block w-full">
                   <button 
+                    type="button"
                     onClick={() => setShowCreateDocMenu(!showCreateDocMenu)}
                     className="bg-white text-red-500 font-bold py-3.5 px-6 rounded-2xl text-sm shadow-md active:scale-95 transition-transform flex items-center justify-center space-x-2 w-full md:w-auto"
                   >
@@ -461,19 +422,19 @@ export default function App() {
                     <span>▼</span>
                   </button>
 
-                  {/* iOS下拉高斯模糊开单菜单 */}
+                  {/* 下拉开单菜单 */}
                   {showCreateDocMenu && (
                     <div className="absolute left-0 right-0 mt-2 z-30 bg-white/95 backdrop-blur-md border border-slate-100 rounded-2xl shadow-xl p-2 text-slate-700 divide-y divide-slate-50">
-                      <button onClick={() => handleStartDoc('sales')} className="w-full text-left p-3.5 hover:bg-slate-50 text-xs font-semibold flex items-center space-x-2 rounded-xl">
+                      <button type="button" onClick={() => handleStartDoc('sales')} className="w-full text-left p-3.5 hover:bg-slate-50 text-xs font-semibold flex items-center space-x-2 rounded-xl">
                         <span>📋</span> <span>快速销售送货单（自动新增专属价格）</span>
                       </button>
-                      <button onClick={() => handleStartDoc('quote')} className="w-full text-left p-3.5 hover:bg-slate-50 text-xs font-semibold flex items-center space-x-2 rounded-xl">
+                      <button type="button" onClick={() => handleStartDoc('quote')} className="w-full text-left p-3.5 hover:bg-slate-50 text-xs font-semibold flex items-center space-x-2 rounded-xl">
                         <span>📊</span> <span>智能客户报价单（带公司抬头格式）</span>
                       </button>
-                      <button onClick={() => handleStartDoc('contract_vat')} className="w-full text-left p-3.5 hover:bg-slate-50 text-xs font-semibold flex items-center space-x-2 rounded-xl">
+                      <button type="button" onClick={() => handleStartDoc('contract_vat')} className="w-full text-left p-3.5 hover:bg-slate-50 text-xs font-semibold flex items-center space-x-2 rounded-xl">
                         <span>✒️</span> <span>采购合同（含 13% 增值税专票模板）</span>
                       </button>
-                      <button onClick={() => handleStartDoc('contract_normal')} className="w-full text-left p-3.5 hover:bg-slate-50 text-xs font-semibold flex items-center space-x-2 rounded-xl">
+                      <button type="button" onClick={() => handleStartDoc('contract_normal')} className="w-full text-left p-3.5 hover:bg-slate-50 text-xs font-semibold flex items-center space-x-2 rounded-xl">
                         <span>✒️</span> <span>采购合同（普通发票 / 不含税模板）</span>
                       </button>
                     </div>
@@ -482,7 +443,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* 顶端搜索框 */}
+            {/* 搜索框 */}
             <div className="relative">
               <input
                 type="text"
@@ -494,11 +455,12 @@ export default function App() {
               <span className="absolute left-4 top-4 text-slate-400">🔍</span>
             </div>
 
-            {/* SKU数据列表 */}
+            {/* SKU列表 */}
             <div className="bg-white rounded-3xl p-4 shadow-sm border border-slate-100">
               <div className="flex justify-between items-center mb-4">
                 <h2 className="font-bold text-slate-800 text-sm">库存 SKU 进价目录 ({filteredSkus.length})</h2>
                 <button 
+                  type="button"
                   onClick={() => {
                     setAddSkuTab('single');
                     setShowAddSkuModal(true);
@@ -522,7 +484,7 @@ export default function App() {
                       <div>
                         <h4 className="font-bold text-slate-800 text-xs">{sku.name}</h4>
                         <span className="text-[10px] text-slate-400 mt-1 block">
-                          {sku.brand || '无品牌'} · {sku.model || '无规格'} · {sku.unit}
+                          {sku.brand || '无品牌'} · {sku.model || '无型号'} · {sku.unit}
                         </span>
                       </div>
                       <div className="text-right">
@@ -551,7 +513,7 @@ export default function App() {
                   {activeDocType === 'contract_vat' && '✒️ 采购合同(增值税专票)'}
                   {activeDocType === 'contract_normal' && '✒️ 采购合同(普通发票)'}
                 </h3>
-                <button onClick={() => setActiveDocType(null)} className="text-xs text-slate-400 hover:text-slate-600">
+                <button type="button" onClick={() => setActiveDocType(null)} className="text-xs text-slate-400 hover:text-slate-600">
                   关闭并返回 ✕
                 </button>
               </div>
@@ -586,7 +548,7 @@ export default function App() {
                 <label className="text-xs font-semibold text-slate-500 block mb-1.5">点击下方物料将其加入送货/报价清单：</label>
                 <div className="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto py-1">
                   {skus.map(s => (
-                    <button key={s.id} onClick={() => handleAddSkuToDoc(s.id)} className="bg-slate-50 hover:bg-red-50 hover:text-red-500 text-slate-600 text-[11px] px-2.5 py-1 rounded-xl transition-all">
+                    <button type="button" key={s.id} onClick={() => handleAddSkuToDoc(s.id)} className="bg-slate-50 hover:bg-red-50 hover:text-red-500 text-slate-600 text-[11px] px-2.5 py-1 rounded-xl transition-all">
                       + {s.name}
                     </button>
                   ))}
@@ -629,12 +591,12 @@ export default function App() {
                 </div>
               )}
 
-              <button onClick={triggerPdfPrint} className="w-full bg-red-500 hover:bg-red-600 text-white rounded-2xl py-3 text-xs font-bold active:scale-95 transition-transform shadow-lg shadow-red-100">
+              <button type="button" onClick={triggerPdfPrint} className="w-full bg-red-500 hover:bg-red-600 text-white rounded-2xl py-3 text-xs font-bold active:scale-95 transition-transform shadow-lg shadow-red-100">
                 💾 打印 / 保存为 PDF 文件
               </button>
             </div>
 
-            {/* 单据真实预览区 (支持精准打印) */}
+            {/* 单据真实预览区 */}
             <div id="print-area" className="print-area bg-white rounded-3xl p-8 shadow-sm border border-slate-100 text-slate-800 space-y-6">
               
               {/* 送货单样式 */}
@@ -668,7 +630,7 @@ export default function App() {
                 </div>
               )}
 
-              {/* 采购合同（税制细分） */}
+              {/* 采购合同 */}
               {(activeDocType === 'contract_vat' || activeDocType === 'contract_normal') && (
                 <div className="space-y-6">
                   <div className="text-center">
@@ -683,7 +645,7 @@ export default function App() {
                 </div>
               )}
 
-              {/* 产品及价格表格 (多模板通用) */}
+              {/* 产品及价格表格 */}
               <table className="w-full text-left text-xs border-collapse border border-slate-200">
                 <thead>
                   <tr className="bg-slate-50 text-[11px] text-slate-600">
@@ -720,7 +682,7 @@ export default function App() {
                 </tbody>
               </table>
 
-              {/* 税务发票合规条款 (针对合同专票/普票的核心渲染) */}
+              {/* 税务发票合规条款 */}
               {activeDocType === 'contract_vat' && (
                 <div className="p-3 bg-slate-50 rounded-xl text-[10px] text-slate-600 leading-relaxed space-y-1">
                   <p className="font-bold text-slate-800">一、税务发票及合规：</p>
@@ -766,6 +728,7 @@ export default function App() {
             <div className="flex justify-between items-center">
               <h2 className="font-bold text-slate-800 text-sm">客户工商信息名录 ({clients.length})</h2>
               <button 
+                type="button"
                 onClick={() => setShowAddClientModal(true)}
                 className="text-xs bg-red-500 hover:bg-red-600 text-white font-bold px-4 py-2 rounded-full"
               >
@@ -802,22 +765,65 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 3: 备份中心 (Google Sheet 的方式) */}
+        {/* TAB 3: 备份中心 */}
         {currentTab === 'backup' && (
           <div className="space-y-4 no-print animate-fade-in">
             <div className="bg-white rounded-3xl p-6 shadow-sm border border-slate-100 space-y-6">
-              <div className="flex items-start space-x-3">
+              
+              {/* 用户登录面板 */}
+              <div className="border-b pb-6">
+                {user ? (
+                  <div className="space-y-3">
+                    <div className="flex justify-between items-center text-xs">
+                      <span className="text-slate-400 font-medium">账号状态</span>
+                      <span className="bg-emerald-50 text-emerald-600 font-bold px-2.5 py-1 rounded-full scale-95">🛡️ 已登录</span>
+                    </div>
+                    <div className="flex justify-between items-center text-xs">
+                      <span className="text-slate-400">已登录账号</span>
+                      <strong className="text-slate-700">{user}</strong>
+                    </div>
+                    <div className="flex justify-between items-center text-xs">
+                      <span className="text-slate-400">Google Sheet 备份</span>
+                      {googleSheetUrl ? (
+                        <span className="text-emerald-500 font-bold text-[10px]">✅ 已配置</span>
+                      ) : (
+                        <span className="text-amber-500 font-bold text-[10px]">⚠️ 未设置</span>
+                      )}
+                    </div>
+                    <button 
+                      type="button" 
+                      onClick={() => { setUser(null); localStorage.removeItem('crm_current_user'); showToast("已退出登录"); }} 
+                      className="w-full mt-2 bg-red-50 hover:bg-red-100 text-red-500 font-bold py-2.5 rounded-xl text-xs active:scale-95 transition-transform"
+                    >
+                      🚪 退出登录此账户
+                    </button>
+                  </div>
+                ) : (
+                  <form onSubmit={handleAuthSubmit} className="space-y-3">
+                    <h3 className="font-bold text-slate-800 text-sm">本地账号（记住备份 URL）</h3>
+                    <input type="email" required placeholder="您的账号邮箱" value={authEmail} onChange={(e) => setAuthEmail(e.target.value)} className="w-full bg-slate-50 border-none rounded-xl px-4 py-3 text-xs outline-none" />
+                    <input type="password" required placeholder="登录/注册密码" value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} className="w-full bg-slate-50 border-none rounded-xl px-4 py-3 text-xs outline-none" />
+                    <button type="submit" className="w-full bg-red-500 text-white font-bold rounded-xl py-3 text-xs active:scale-95 transition-transform">
+                      {isSignUp ? '🔥 创建新账号' : '🔐 登录并载入配置'}
+                    </button>
+                    <button type="button" onClick={() => setIsSignUp(!isSignUp)} className="w-full text-center text-[10px] text-slate-400 underline">
+                      {isSignUp ? '已有账号？去登录' : '没有账号？点此注册'}
+                    </button>
+                  </form>
+                )}
+              </div>
+
+              <div className="flex items-start space-x-3 pt-2">
                 <span className="text-2xl">☁️</span>
                 <div>
-                  <h2 className="text-lg font-bold text-slate-800">Google Sheet 云端备份中心</h2>
+                  <h2 className="text-lg font-bold text-slate-800">Google Sheet 云同步控制</h2>
                   <p className="text-xs text-slate-500 mt-1">
-                    支持将 CRM 的 SKU 进价、客户多项工商卡片及专属优惠价全部备份至您的谷歌表格中。
+                    系统支持自动记忆该接口链接。新设备登录上述账户后，会自动调取并还原备份。
                   </p>
                 </div>
               </div>
 
               <div className="space-y-4">
-                {/* Google Sheet URL 配置 */}
                 <div>
                   <label className="text-xs font-semibold text-slate-600 block mb-1.5">Google Sheet Web App URL</label>
                   <input 
@@ -830,7 +836,6 @@ export default function App() {
                     className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-xs focus:ring-1 focus:ring-red-400 outline-none font-mono" 
                     placeholder="https://script.google.com/macros/s/..."
                   />
-                  <span className="text-[9px] text-slate-400 mt-1 block">登录您的账号后，该 URL 链接将被【自动记忆】，更换设备只需登录账号即可免输入下载数据。</span>
                 </div>
 
                 <div className="grid grid-cols-2 gap-3">
@@ -839,13 +844,14 @@ export default function App() {
                     <div className="text-xs font-bold text-slate-700 mt-1">{lastSyncTime}</div>
                   </div>
                   <div className="bg-slate-50 p-3.5 rounded-2xl text-center border border-slate-100">
-                    <div className="text-[10px] text-slate-400 font-medium">账户登录状态</div>
-                    <div className="text-xs font-bold text-slate-700 mt-1">{user ? '已安全记住配置' : '本地离线状态'}</div>
+                    <div className="text-[10px] text-slate-400 font-medium">本地数据规模</div>
+                    <div className="text-xs font-bold text-slate-700 mt-1">{skus.length} SKU / {clients.length} 客户</div>
                   </div>
                 </div>
 
                 <div className="grid grid-cols-2 gap-3 pt-2">
                   <button 
+                    type="button"
                     onClick={handlePullFromSheet}
                     className="bg-slate-800 hover:bg-slate-900 text-white font-semibold py-3.5 rounded-2xl text-xs active:scale-95 transition-transform flex flex-col items-center justify-center space-y-1"
                   >
@@ -854,8 +860,9 @@ export default function App() {
                   </button>
 
                   <button 
+                    type="button"
                     onClick={handleBackupToSheet}
-                    className="bg-red-500 hover:bg-red-600 text-white font-semibold py-3.5 rounded-2xl text-xs active:scale-95 transition-transform flex flex-col items-center justify-center space-y-1 shadow-md shadow-red-100"
+                    className="bg-red-50 hover:bg-red-600 text-white font-semibold py-3.5 rounded-2xl text-xs active:scale-95 transition-transform flex flex-col items-center justify-center space-y-1 shadow-md shadow-red-100"
                   >
                     <span>⬆️</span>
                     <span>同步到 Google Sheet</span>
@@ -873,10 +880,10 @@ export default function App() {
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm no-print">
           <div className="bg-white rounded-3xl p-6 w-full max-w-md space-y-4 shadow-xl">
             <div className="flex border-b border-slate-100 pb-2">
-              <button onClick={() => setAddSkuTab('single')} className={`flex-1 text-center py-2 text-xs font-semibold ${addSkuTab === 'single' ? 'text-red-500 border-b-2 border-red-500' : 'text-slate-400'}`}>
+              <button type="button" onClick={() => setAddSkuTab('single')} className={`flex-1 text-center py-2 text-xs font-semibold ${addSkuTab === 'single' ? 'text-red-500 border-b-2 border-red-500' : 'text-slate-400'}`}>
                 单个录入
               </button>
-              <button onClick={() => setAddSkuTab('batch')} className={`flex-1 text-center py-2 text-xs font-semibold ${addSkuTab === 'batch' ? 'text-red-500 border-b-2 border-red-500' : 'text-slate-400'}`}>
+              <button type="button" onClick={() => setAddSkuTab('batch')} className={`flex-1 text-center py-2 text-xs font-semibold ${addSkuTab === 'batch' ? 'text-red-500 border-b-2 border-red-500' : 'text-slate-400'}`}>
                 批量导入表格
               </button>
             </div>
@@ -891,8 +898,8 @@ export default function App() {
                 <textarea placeholder="备注说明" id="add-note" className="w-full bg-slate-50 border-none rounded-xl px-3.5 py-2.5 h-16 resize-none" />
                 
                 <div className="flex space-x-2 pt-2">
-                  <button onClick={() => setShowAddSkuModal(false)} className="flex-1 bg-slate-100 text-slate-700 rounded-xl py-2.5 text-xs font-semibold">取消</button>
-                  <button onClick={() => {
+                  <button type="button" onClick={() => setShowAddSkuModal(false)} className="flex-1 bg-slate-100 text-slate-700 rounded-xl py-2.5 text-xs font-semibold">取消</button>
+                  <button type="button" onClick={() => {
                     const name = document.getElementById('add-name').value;
                     const price = document.getElementById('add-price').value;
                     const brand = document.getElementById('add-brand').value;
@@ -921,8 +928,8 @@ export default function App() {
                   <label className="text-xs font-semibold text-slate-600 block mb-1">或直接粘贴 Excel 列数据</label>
                   <textarea value={batchPasteText} onChange={(e) => setBatchPasteText(e.target.value)} placeholder="名称,进价,品牌,型号,单位,备注 (直接复制多列并粘贴)..." className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5 text-xs h-32 outline-none" />
                   <div className="flex space-x-2">
-                    <button onClick={() => setShowAddSkuModal(false)} className="flex-1 bg-slate-100 text-slate-700 rounded-xl py-2.5 text-xs font-semibold">取消</button>
-                    <button onClick={handleBatchTextImport} className="flex-1 bg-red-500 text-white rounded-xl py-2.5 text-xs font-semibold">执行批量导入</button>
+                    <button type="button" onClick={() => setShowAddSkuModal(false)} className="flex-1 bg-slate-100 text-slate-700 rounded-xl py-2.5 text-xs font-semibold">取消</button>
+                    <button type="button" onClick={handleBatchTextImport} className="flex-1 bg-red-500 text-white rounded-xl py-2.5 text-xs font-semibold">执行批量导入</button>
                   </div>
                 </div>
               </div>
@@ -945,9 +952,9 @@ export default function App() {
               <textarea defaultValue={selectedSku.note} id="edit-note" placeholder="备注说明" className="w-full bg-slate-50 border-none rounded-xl px-3.5 py-2.5 h-16 resize-none" />
             </div>
             <div className="flex space-x-2">
-              <button onClick={() => { handleDeleteSku(selectedSku.id); setSelectedSku(null); }} className="bg-red-50 text-red-500 rounded-xl px-3.5 text-xs font-semibold">删除</button>
-              <button onClick={() => setSelectedSku(null)} className="flex-1 bg-slate-100 text-slate-700 rounded-xl py-2.5 text-xs font-semibold">取消</button>
-              <button onClick={() => {
+              <button type="button" onClick={() => { handleDeleteSku(selectedSku.id); setSelectedSku(null); }} className="bg-red-50 text-red-500 rounded-xl px-3.5 text-xs font-semibold">删除</button>
+              <button type="button" onClick={() => setSelectedSku(null)} className="flex-1 bg-slate-100 text-slate-700 rounded-xl py-2.5 text-xs font-semibold">取消</button>
+              <button type="button" onClick={() => {
                 const name = document.getElementById('edit-name').value;
                 const price = document.getElementById('edit-price').value;
                 const brand = document.getElementById('edit-brand').value;
@@ -978,8 +985,8 @@ export default function App() {
               <input type="text" placeholder="联系地址" id="c-addr" className="w-full bg-slate-50 border-none rounded-xl px-3.5 py-2.5" />
             </div>
             <div className="flex space-x-2">
-              <button onClick={() => setShowAddClientModal(false)} className="flex-1 bg-slate-100 text-slate-700 rounded-xl py-2.5 text-xs font-semibold">取消</button>
-              <button onClick={() => {
+              <button type="button" onClick={() => setShowAddClientModal(false)} className="flex-1 bg-slate-100 text-slate-700 rounded-xl py-2.5 text-xs font-semibold">取消</button>
+              <button type="button" onClick={() => {
                 const name = document.getElementById('c-name').value;
                 const company = document.getElementById('c-comp').value;
                 const taxId = document.getElementById('c-tax').value;
@@ -1036,7 +1043,7 @@ export default function App() {
                 <input type="text" defaultValue={selectedClient.address} id="ec-addr" className="w-full bg-slate-50 border-none rounded-xl px-3 py-2" />
               </div>
 
-              {/* 该客户专用的 SKU 优惠价格查阅、手动删除或修改 */}
+              {/* 专属售价 */}
               <div className="pt-3 border-t">
                 <span className="text-[10px] font-bold text-red-500 block mb-2">已绑定专属客户售价：</span>
                 {Object.keys(selectedClient.skuPrices || {}).length === 0 ? (
@@ -1068,6 +1075,7 @@ export default function App() {
                             />
                             <span>元</span>
                             <button 
+                              type="button"
                               onClick={() => {
                                 const updatedPrices = { ...selectedClient.skuPrices };
                                 delete updatedPrices[sId];
@@ -1093,9 +1101,9 @@ export default function App() {
             </div>
 
             <div className="flex space-x-2">
-              <button onClick={() => { handleDeleteClient(selectedClient.id); setSelectedClient(null); }} className="bg-red-50 text-red-500 rounded-xl px-3.5 text-xs font-semibold">注销客户</button>
-              <button onClick={() => setSelectedClient(null)} className="flex-1 bg-slate-100 text-slate-700 rounded-xl py-2.5 text-xs font-semibold">取消</button>
-              <button onClick={() => {
+              <button type="button" onClick={() => { handleDeleteClient(selectedClient.id); setSelectedClient(null); }} className="bg-red-50 text-red-500 rounded-xl px-3.5 text-xs font-semibold">注销客户</button>
+              <button type="button" onClick={() => setSelectedClient(null)} className="flex-1 bg-slate-100 text-slate-700 rounded-xl py-2.5 text-xs font-semibold">取消</button>
+              <button type="button" onClick={() => {
                 const name = document.getElementById('ec-name').value;
                 const company = document.getElementById('ec-comp').value;
                 const taxId = document.getElementById('ec-tax').value;
@@ -1112,35 +1120,35 @@ export default function App() {
         </div>
       )}
 
-      {/* 7. 全局弹窗：账号注册与登录中心（记忆链接同步） */}
+      {/* 7. 全局弹窗：账号注册与登录中心 */}
       {showAuthModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm no-print">
           <div className="bg-white rounded-3xl p-6 w-full max-w-sm space-y-4 shadow-xl">
-            <h3 className="font-bold text-slate-800">Firebase 用户保护中心</h3>
+            <h3 className="font-bold text-slate-800">账号管理中心</h3>
             {user ? (
               <div className="space-y-4 text-xs">
                 <div className="bg-slate-50 p-3 rounded-xl">
-                  <p className="text-slate-400">当前已登录绑定账号</p>
-                  <p className="font-bold text-slate-700 mt-1">{user.email}</p>
+                  <p className="text-slate-400">当前已登录账号</p>
+                  <p className="font-bold text-slate-700 mt-1">{user}</p>
                 </div>
-                <p className="text-[10px] text-slate-400">在此登录后，您的 Google Sheet URL 备份配置已自动由系统记住保护。即使在其他手机登录，也可免去再次输入的繁琐。</p>
+                <p className="text-[10px] text-slate-400">登录后，您的 Google Sheet 备份链接会自动记住到该账号下。同一设备切换账号即可自动载入对应配置。</p>
                 <div className="flex space-x-2">
-                  <button onClick={() => setShowAuthModal(false)} className="flex-1 bg-slate-100 text-slate-700 rounded-xl py-2.5 text-xs font-semibold">关闭窗口</button>
-                  <button onClick={() => { signOut(auth); setShowAuthModal(false); }} className="flex-1 bg-red-500 text-white rounded-xl py-2.5 text-xs font-semibold">退出账号</button>
+                  <button type="button" onClick={() => setShowAuthModal(false)} className="flex-1 bg-slate-100 text-slate-700 rounded-xl py-2.5 text-xs font-semibold">关闭窗口</button>
+                  <button type="button" onClick={() => { setUser(null); localStorage.removeItem('crm_current_user'); setShowAuthModal(false); showToast("已退出登录"); }} className="flex-1 bg-red-500 text-white rounded-xl py-2.5 text-xs font-semibold">退出账号</button>
                 </div>
               </div>
             ) : (
               <form onSubmit={handleAuthSubmit} className="space-y-3">
                 <div className="p-3 bg-red-50/50 rounded-2xl border border-red-100 text-[10px] text-red-600/90 leading-relaxed">
-                  提示：通过该账号登录后，系统会自动**跨设备同步记住**您的 Google Sheet 备份接口 URL，便于新设备一键还原导入数据库 [1]。
+                  提示：注册账号后，您的 Google Sheet 备份 URL 会自动绑定到该账号。登录即可载入对应配置。
                 </div>
                 <input type="email" required placeholder="注册/登录邮箱地址" value={authEmail} onChange={(e) => setAuthEmail(e.target.value)} className="w-full bg-slate-50 border-none rounded-xl px-3.5 py-2.5 text-xs" />
-                <input type="password" required placeholder="账户密码 (不小于6位)" value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} className="w-full bg-slate-50 border-none rounded-xl px-3.5 py-2.5 text-xs" />
-                <button type="submit" disabled={isCloudSyncing} className="w-full bg-red-500 text-white font-bold rounded-xl py-2.5 text-xs">
-                  {isSignUp ? '开始创建并绑定账户' : '安全登录并载入配置'}
+                <input type="password" required placeholder="账户密码 (不小于6位)" value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} className="w-full bg-slate-50 border-none rounded-xl px-4 py-3 text-xs" />
+                <button type="submit" className="w-full bg-red-500 text-white font-bold rounded-xl py-2.5 text-xs">
+                  {isSignUp ? '注册新账号' : '登录并载入配置'}
                 </button>
                 <button type="button" onClick={() => setIsSignUp(!isSignUp)} className="w-full text-center text-[10px] text-slate-400 underline">
-                  {isSignUp ? '已有安全账号？去登录' : '没有账号？点此免费注册'}
+                  {isSignUp ? '已有账号？去登录' : '没有账号？点此注册'}
                 </button>
                 <button type="button" onClick={() => setShowAuthModal(false)} className="w-full text-slate-400 text-[11px] font-semibold pt-1">暂不登录</button>
               </form>
@@ -1149,7 +1157,7 @@ export default function App() {
         </div>
       )}
 
-      {/* 8. 底栏固定高斯模糊导航 (精简为 3 项) */}
+      {/* 8. 底栏导航 */}
       <nav className="fixed bottom-0 left-0 right-0 z-30 backdrop-blur-md bg-white/75 border-t border-slate-200/50 shadow-[0_-2px_10px_rgba(0,0,0,0.03)] flex justify-around py-3 px-2 no-print safe-bottom">
         {[
           { id: 'home', label: '首页库/开单', icon: '⛺' },
@@ -1158,6 +1166,7 @@ export default function App() {
         ].map(tab => (
           <button 
             key={tab.id}
+            type="button"
             onClick={() => {
               setCurrentTab(tab.id);
               setActiveDocType(null); // 切回时退出开单页面
