@@ -1,0 +1,1175 @@
+import React, { useState, useEffect, useMemo } from 'react';
+import { auth, db } from './firebase';
+import { 
+  onAuthStateChanged, 
+  signInWithEmailAndPassword, 
+  createUserWithEmailAndPassword, 
+  signOut 
+} from 'firebase/auth';
+import { doc, getDoc, setDoc } from 'firebase/firestore';
+
+// 初始默认演示数据
+const defaultSkus = [
+  { id: '1', name: '手提式干粉灭火器', price: 45, brand: '消防先锋', model: 'MFZ/ABC4', unit: '具', note: '常用规格', updatedAt: new Date().toLocaleString() },
+  { id: '2', name: '感烟探测器', price: 28, brand: '智能安防', model: 'JTY-GD-FSP5', unit: '个', note: '工程款', updatedAt: new Date().toLocaleString() }
+];
+
+const defaultClients = [
+  { 
+    id: 'c1', 
+    name: '恒大消防工程公司', 
+    contact: '张经理', 
+    phone: '13800138000', 
+    address: '广州市天河区恒大总部大厦A座', 
+    company: '恒大消防设备工程有限公司', 
+    taxId: '91440101MA59XXXXXX', 
+    bankAccount: '4401200919200000000', 
+    bankName: '中国建设银行广州正佳支行',
+    skuPrices: { '1': 55, '2': 35 }, 
+    updatedAt: new Date().toLocaleString() 
+  },
+  { 
+    id: 'c2', 
+    name: '万科物业管理部', 
+    contact: '李主管', 
+    phone: '13900139000', 
+    address: '深圳市盐田区万科中心B栋', 
+    company: '深圳万科物业服务有限公司', 
+    taxId: '91440300MA50XXXXXX', 
+    bankAccount: '4000023019200000000', 
+    bankName: '招商银行深圳分行营业部',
+    skuPrices: { '1': 58 }, 
+    updatedAt: new Date().toLocaleString() 
+  }
+];
+
+export default function App() {
+  // ---- 1. 本地数据库状态 ----
+  const [skus, setSkus] = useState(() => JSON.parse(localStorage.getItem('crm_skus')) || defaultSkus);
+  const [clients, setClients] = useState(() => JSON.parse(localStorage.getItem('crm_clients')) || defaultClients);
+  const [recycleBin, setRecycleBin] = useState(() => JSON.parse(localStorage.getItem('crm_recycle_bin')) || []);
+  const [currentTab, setCurrentTab] = useState('home'); // home, clients, backup
+  
+  // 基础公用名称
+  const [companyName, setCompanyName] = useState(() => localStorage.getItem('crm_comp_name') || '消防器材智能设备有限公司');
+  const [creatorName, setCreatorName] = useState(() => localStorage.getItem('crm_creator') || '张三');
+
+  // ---- 2. Firebase 安全及记忆锁状态 ----
+  const [user, setUser] = useState(null);
+  const [isAuthLoading, setIsAuthLoading] = useState(true);
+  const [databaseReady, setDatabaseReady] = useState(false); // 写入锁
+  const [isCloudSyncing, setIsCloudSyncing] = useState(false);
+  const [googleSheetUrl, setGoogleSheetUrl] = useState(() => localStorage.getItem('crm_gsheet_url') || '');
+  const [lastSyncTime, setLastSyncTime] = useState(() => localStorage.getItem('crm_last_sync') || '本地离线存储');
+  
+  // 账户登录控制
+  const [showAuthModal, setShowAuthModal] = useState(false);
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [isSignUp, setIsSignUp] = useState(false);
+
+  // ---- 3. UI 交互控制状态 ----
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [selectedSku, setSelectedSku] = useState(null);
+  const [selectedClient, setSelectedClient] = useState(null);
+  const [showAddSkuModal, setShowAddSkuModal] = useState(false);
+  const [addSkuTab, setAddSkuTab] = useState('single'); // single, batch
+  const [batchPasteText, setBatchPasteText] = useState('');
+  const [showRecycleBin, setShowRecycleBin] = useState(false);
+  const [notification, setNotification] = useState(null);
+
+  // ---- 4. 单据开单浮层及编辑状态 ----
+  const [showCreateDocMenu, setShowCreateDocMenu] = useState(false);
+  const [activeDocType, setActiveDocType] = useState(null); // null, 'sales', 'quote', 'contract_vat', 'contract_normal'
+  const [activeClientName, setActiveClientName] = useState('');
+  const [activeItems, setActiveItems] = useState([]); // [{ skuId, qty, price }]
+  const [documentNo, setDocumentNo] = useState('');
+  const [activeDate, setActiveDate] = useState(() => new Date().toISOString().split('T')[0]);
+
+  // 新增客户表单暂存
+  const [showAddClientModal, setShowAddClientModal] = useState(false);
+
+  // ==========================================
+  // 🛡️ 底层防御：登录状态监听与【账号URL记忆拉取】
+  // ==========================================
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+      setUser(currentUser);
+      setIsAuthLoading(false);
+
+      if (currentUser) {
+        setIsCloudSyncing(true);
+        try {
+          setDatabaseReady(false); // 闭锁
+
+          // 从 Firestore 读取该用户云端配置，自动“记忆” Google Sheet 链接
+          const docRef = doc(db, "users", currentUser.uid);
+          const docSnap = await getDoc(docRef);
+
+          if (docSnap.exists()) {
+            const cloudConfig = docSnap.data();
+            if (cloudConfig.googleSheetUrl) {
+              setGoogleSheetUrl(cloudConfig.googleSheetUrl);
+              localStorage.setItem('crm_gsheet_url', cloudConfig.googleSheetUrl);
+            }
+            showToast("成功同步云端账号配置");
+          }
+        } catch (error) {
+          showToast("云端记忆拉取失败: " + error.message);
+        } finally {
+          setIsCloudSyncing(false);
+          setDatabaseReady(true); // 开锁
+        }
+      } else {
+        setDatabaseReady(false);
+      }
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  // 当 Google Sheet 变更时，如果处于登录状态，自动在云端记住这个配置
+  useEffect(() => {
+    if (!user || !databaseReady) return;
+    const saveConfigToCloud = async () => {
+      try {
+        const docRef = doc(db, "users", user.uid);
+        await setDoc(docRef, { googleSheetUrl }, { merge: true });
+      } catch (e) {
+        console.error("无法保存云端配置: ", e);
+      }
+    };
+    const timer = setTimeout(saveConfigToCloud, 2000);
+    return () => clearTimeout(timer);
+  }, [googleSheetUrl, user, databaseReady]);
+
+  // 本地缓存备份双重安全保障
+  useEffect(() => {
+    localStorage.setItem('crm_skus', JSON.stringify(skus));
+    localStorage.setItem('crm_clients', JSON.stringify(clients));
+    localStorage.setItem('crm_recycle_bin', JSON.stringify(recycleBin));
+    localStorage.setItem('crm_comp_name', companyName);
+    localStorage.setItem('crm_creator', creatorName);
+  }, [skus, clients, recycleBin, companyName, creatorName]);
+
+  const showToast = (msg) => {
+    setNotification(msg);
+    setTimeout(() => setNotification(null), 3000);
+  };
+
+  // ---- 业务逻辑：Google Sheet 备份同步 ----
+  const handleBackupToSheet = () => {
+    if (!googleSheetUrl) {
+      showToast("请输入合法的 Google Sheet 接口 URL");
+      return;
+    }
+    showToast("数据加密上传中...");
+    fetch(googleSheetUrl, {
+      method: 'POST',
+      mode: 'no-cors',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ skus, clients })
+    })
+    .then(() => {
+      const now = new Date().toLocaleString();
+      setLastSyncTime(now);
+      localStorage.setItem('crm_last_sync', now);
+      showToast("✅ 已成功同步备份至 Google Sheet！");
+    })
+    .catch(err => {
+      showToast("同步上传失败: " + err.message);
+    });
+  };
+
+  const handlePullFromSheet = () => {
+    if (!googleSheetUrl) {
+      showToast("请先配置 Google Sheet 接口 URL");
+      return;
+    }
+    showToast("正在连接云端拉取表格...");
+    fetch(googleSheetUrl)
+      .then(res => res.json())
+      .then(data => {
+        if (data.status === 'success') {
+          if (confirm(`下载成功！\n云端发现产品: ${data.skus?.length || 0} 个\n云端发现客户: ${data.clients?.length || 0} 位\n\n确认覆盖并恢复至当前设备本地吗？`)) {
+            if (data.skus) setSkus(data.skus);
+            if (data.clients) setClients(data.clients);
+            const now = new Date().toLocaleString();
+            setLastSyncTime(now + " (下载还原)");
+            localStorage.setItem('crm_last_sync', now);
+            showToast("🎉 数据还原同步成功！");
+          }
+        } else {
+          showToast("云端返回解析异常");
+        }
+      })
+      .catch(err => {
+        showToast("拉取失败，请确认表格 Web App 发布无误");
+      });
+  };
+
+  // ---- 业务逻辑：快捷开单生成器 ----
+  const handleStartDoc = (type) => {
+    setActiveDocType(type);
+    setDocumentNo('HT-' + Date.now().toString().slice(-6));
+    setActiveItems([]);
+    setActiveClientName('');
+    setShowCreateDocMenu(false);
+  };
+
+  // 添加物料至单据（如果不存在则新增 SKU 并分配客户价）
+  const handleAddSkuToDoc = (skuId) => {
+    const targetSku = skus.find(s => s.id === skuId);
+    if (!targetSku) return;
+
+    // 默认寻找客户对应的专属售价，若无则默认为 0
+    const clientObj = clients.find(c => c.name === activeClientName);
+    const savedPrice = clientObj?.skuPrices?.[skuId] || 0;
+
+    setActiveItems([...activeItems, {
+      skuId: targetSku.id,
+      qty: 1,
+      price: savedPrice
+    }]);
+  };
+
+  // 专属价格保存逻辑：每次新增或修改销售单中的产品价格，自动同步到客户子售价中，并不修改原生SKU进价
+  const handleDocPriceChange = (index, newPrice) => {
+    const updated = [...activeItems];
+    updated[index].price = Number(newPrice) || 0;
+    setActiveItems(updated);
+
+    const currentItem = updated[index];
+    if (activeClientName) {
+      // 如果客户不存在，自动创建该客户
+      const clientExists = clients.some(c => c.name === activeClientName);
+      if (!clientExists) {
+        const newC = {
+          id: 'c_' + Date.now(),
+          name: activeClientName,
+          contact: '默认联系人',
+          skuPrices: { [currentItem.skuId]: Number(newPrice) },
+          updatedAt: new Date().toLocaleString()
+        };
+        setClients([newC, ...clients]);
+      } else {
+        // 存在则更新专属价
+        setClients(prev => prev.map(c => {
+          if (c.name === activeClientName) {
+            return {
+              ...c,
+              skuPrices: { ...c.skuPrices, [currentItem.skuId]: Number(newPrice) },
+              updatedAt: new Date().toLocaleString()
+            };
+          }
+          return c;
+        }));
+      }
+    }
+  };
+
+  // ---- 业务逻辑：基础添加删除 ----
+  const handleAddSku = (newSku) => {
+    const skuWithId = { 
+      ...newSku, 
+      id: Date.now().toString(),
+      price: Number(newSku.price) || 0,
+      updatedAt: new Date().toLocaleString()
+    };
+    setSkus([skuWithId, ...skus]);
+    showToast(`产品 ${newSku.name} 已入库`);
+  };
+
+  const handleEditSku = (updatedSku) => {
+    setSkus(skus.map(item => item.id === updatedSku.id ? { ...updatedSku, price: Number(updatedSku.price), updatedAt: new Date().toLocaleString() } : item));
+    showToast("产品信息已更新");
+  };
+
+  const handleDeleteSku = (skuId) => {
+    const target = skus.find(item => item.id === skuId);
+    if (target) {
+      setRecycleBin([...recycleBin, { type: 'sku', data: target, deletedAt: new Date().toLocaleString() }]);
+      setSkus(skus.filter(item => item.id !== skuId));
+      showToast(`产品 "${target.name}" 已移入回收站`);
+    }
+  };
+
+  const handleAddClient = (newC) => {
+    const clientWithId = {
+      ...newC,
+      id: 'c_' + Date.now(),
+      skuPrices: {},
+      updatedAt: new Date().toLocaleString()
+    };
+    setClients([clientWithId, ...clients]);
+    showToast(`客户 ${newC.name} 录入成功`);
+  };
+
+  const handleEditClient = (updatedC) => {
+    setClients(clients.map(item => item.id === updatedC.id ? { ...updatedC, updatedAt: new Date().toLocaleString() } : item));
+    showToast("客户工商信息修改成功");
+  };
+
+  const handleExportData = () => {
+    const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify({ skus, clients, recycleBin }));
+    const downloadAnchor = document.createElement('a');
+    downloadAnchor.setAttribute("href", dataStr);
+    downloadAnchor.setAttribute("download", `fire_crm_local_backup_${new Date().toISOString().slice(0,10)}.json`);
+    document.body.appendChild(downloadAnchor);
+    downloadAnchor.click();
+    downloadAnchor.remove();
+    showToast("本地数据导出成功");
+  };
+
+  const handleCsvImport = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const text = event.target.result;
+      const lines = text.split('\n');
+      const newSkusList = [];
+      const startIdx = (lines[0].includes('名称') || lines[0].includes('品名') || lines[0].includes('name')) ? 1 : 0;
+      
+      for (let i = startIdx; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        const cols = line.split(',').map(col => col.trim().replace(/^["']|["']$/g, ''));
+        if (cols[0]) {
+          newSkusList.push({
+            id: (Date.now() + i).toString(),
+            name: cols[0],
+            price: Number(cols[1]) || 0,
+            brand: cols[2] || '',
+            model: cols[3] || '',
+            unit: cols[4] || '个',
+            note: cols[5] || '',
+            updatedAt: new Date().toLocaleString()
+          });
+        }
+      }
+
+      if (newSkusList.length > 0) {
+        setSkus(prev => [...newSkusList, ...prev]);
+        showToast(`成功导入 ${newSkusList.length} 个 SKU`);
+        setShowAddSkuModal(false);
+      } else {
+        showToast("未读取到可用物料数据");
+      }
+    };
+    reader.readAsText(file, 'UTF-8');
+  };
+
+  const handleBatchTextImport = () => {
+    if (!batchPasteText.trim()) return;
+    const lines = batchPasteText.split('\n');
+    const newSkusList = [];
+
+    lines.forEach((line, idx) => {
+      const trimmedLine = line.trim();
+      if (!trimmedLine) return;
+      const delimiter = trimmedLine.includes('\t') ? '\t' : ',';
+      const cols = trimmedLine.split(delimiter).map(col => col.trim());
+
+      if (cols[0]) {
+        newSkusList.push({
+          id: (Date.now() + idx).toString(),
+          name: cols[0],
+          price: Number(cols[1]) || 0,
+          brand: cols[2] || '',
+          model: cols[3] || '',
+          unit: cols[4] || '个',
+          note: cols[5] || '',
+          updatedAt: new Date().toLocaleString()
+        });
+      }
+    });
+
+    if (newSkusList.length > 0) {
+      setSkus(prev => [...newSkusList, ...prev]);
+      showToast(`成功批量导入 ${newSkusList.length} 个 SKU`);
+      setBatchPasteText('');
+      setShowAddSkuModal(false);
+    } else {
+      showToast("解析失败");
+    }
+  };
+
+  const handleAuthSubmit = async (e) => {
+    e.preventDefault();
+    if (!authEmail || !authPassword) return;
+    setIsCloudSyncing(true);
+    try {
+      if (isSignUp) {
+        await createUserWithEmailAndPassword(auth, authEmail, authPassword);
+        showToast("注册成功！云端配置已分配");
+      } else {
+        await signInWithEmailAndPassword(auth, authEmail, authPassword);
+        showToast("登录成功，链接已拉取并记忆");
+      }
+      setShowAuthModal(false);
+    } catch (err) {
+      showToast("验证失败: " + err.message);
+    } finally {
+      setIsCloudSyncing(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen pb-24 bg-gradient-to-b from-slate-50 to-slate-100 flex flex-col relative">
+      
+      {/* 1. iOS 页眉 */}
+      <header className="sticky top-0 z-30 backdrop-blur-md bg-white/70 border-b border-white/20 px-4 py-3 flex items-center justify-between shadow-sm no-print">
+        <div className="flex items-center space-x-3">
+          <span className="font-bold text-lg text-slate-800 tracking-wide">消防CRM智能版</span>
+        </div>
+        <div className="flex items-center space-x-2">
+          {/* 全局账号入口 */}
+          <button 
+            onClick={() => setShowAuthModal(true)} 
+            className="p-1.5 rounded-full bg-slate-100 hover:bg-slate-200 active:scale-95 transition-all text-sm flex items-center space-x-1.5 px-3"
+          >
+            <span>👤</span>
+            <span className="text-xs font-semibold text-slate-600">{user ? user.email.split('@')[0] : '登录账号'}</span>
+          </button>
+        </div>
+      </header>
+
+      {/* 2. 主页面渲染区 */}
+      <main className="flex-1 p-4 max-w-4xl mx-auto w-full">
+        
+        {/* TAB 1: 首页 (SKU 库 + 聚合开单中心) */}
+        {currentTab === 'home' && !activeDocType && (
+          <div className="space-y-4 no-print">
+            
+            {/* 开单聚合中心按钮 */}
+            <div className="bg-gradient-to-r from-red-500 to-rose-600 rounded-3xl p-6 text-white shadow-xl shadow-red-100 relative overflow-hidden">
+              <div className="absolute right-0 bottom-0 translate-x-4 translate-y-4 opacity-15 text-9xl">📋</div>
+              <div className="relative z-10 space-y-4">
+                <div>
+                  <h3 className="font-bold text-lg">智能业务开单中心</h3>
+                  <p className="text-xs text-white/80 mt-1">一键生成销售单、报价单及增值税合同，契合消防器材交易</p>
+                </div>
+                <div className="relative inline-block w-full">
+                  <button 
+                    onClick={() => setShowCreateDocMenu(!showCreateDocMenu)}
+                    className="bg-white text-red-500 font-bold py-3.5 px-6 rounded-2xl text-sm shadow-md active:scale-95 transition-transform flex items-center justify-center space-x-2 w-full md:w-auto"
+                  >
+                    <span>📄 开始开具新单据 / 合同</span>
+                    <span>▼</span>
+                  </button>
+
+                  {/* iOS下拉高斯模糊开单菜单 */}
+                  {showCreateDocMenu && (
+                    <div className="absolute left-0 right-0 mt-2 z-30 bg-white/95 backdrop-blur-md border border-slate-100 rounded-2xl shadow-xl p-2 text-slate-700 divide-y divide-slate-50">
+                      <button onClick={() => handleStartDoc('sales')} className="w-full text-left p-3.5 hover:bg-slate-50 text-xs font-semibold flex items-center space-x-2 rounded-xl">
+                        <span>📋</span> <span>快速销售送货单（自动新增专属价格）</span>
+                      </button>
+                      <button onClick={() => handleStartDoc('quote')} className="w-full text-left p-3.5 hover:bg-slate-50 text-xs font-semibold flex items-center space-x-2 rounded-xl">
+                        <span>📊</span> <span>智能客户报价单（带公司抬头格式）</span>
+                      </button>
+                      <button onClick={() => handleStartDoc('contract_vat')} className="w-full text-left p-3.5 hover:bg-slate-50 text-xs font-semibold flex items-center space-x-2 rounded-xl">
+                        <span>✒️</span> <span>采购合同（含 13% 增值税专票模板）</span>
+                      </button>
+                      <button onClick={() => handleStartDoc('contract_normal')} className="w-full text-left p-3.5 hover:bg-slate-50 text-xs font-semibold flex items-center space-x-2 rounded-xl">
+                        <span>✒️</span> <span>采购合同（普通发票 / 不含税模板）</span>
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* 顶端搜索框 */}
+            <div className="relative">
+              <input
+                type="text"
+                placeholder="快速检索 SKU 品名、品牌、规格..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="w-full bg-white border border-slate-200 rounded-2xl px-4 py-3.5 pl-11 outline-none text-slate-700 placeholder-slate-400 focus:border-red-400 focus:ring-1 focus:ring-red-400 transition-all shadow-sm"
+              />
+              <span className="absolute left-4 top-4 text-slate-400">🔍</span>
+            </div>
+
+            {/* SKU数据列表 */}
+            <div className="bg-white rounded-3xl p-4 shadow-sm border border-slate-100">
+              <div className="flex justify-between items-center mb-4">
+                <h2 className="font-bold text-slate-800 text-sm">库存 SKU 进价目录 ({filteredSkus.length})</h2>
+                <button 
+                  onClick={() => {
+                    setAddSkuTab('single');
+                    setShowAddSkuModal(true);
+                  }}
+                  className="text-xs bg-red-50 text-red-500 font-bold px-3 py-1.5 rounded-full"
+                >
+                  + 新增物料
+                </button>
+              </div>
+
+              {filteredSkus.length === 0 ? (
+                <div className="text-center py-12 text-slate-400 text-sm">暂无匹配的 SKU</div>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                  {filteredSkus.map(sku => (
+                    <div 
+                      key={sku.id}
+                      onClick={() => setSelectedSku(sku)}
+                      className="p-3.5 bg-slate-50 rounded-2xl hover:bg-slate-100/60 transition-all cursor-pointer border border-transparent hover:border-slate-100 flex justify-between items-center"
+                    >
+                      <div>
+                        <h4 className="font-bold text-slate-800 text-xs">{sku.name}</h4>
+                        <span className="text-[10px] text-slate-400 mt-1 block">
+                          {sku.brand || '无品牌'} · {sku.model || '无规格'} · {sku.unit}
+                        </span>
+                      </div>
+                      <div className="text-right">
+                        <span className="text-xs font-bold text-red-500">￥{sku.price}</span>
+                        <span className="text-[9px] text-slate-400 block mt-0.5">原生底价</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* TAB 1 (分支): 开单及合规合同预览和打印 */}
+        {activeDocType && (
+          <div className="space-y-4">
+            
+            {/* 开单属性控制器 */}
+            <div className="bg-white rounded-3xl p-5 shadow-sm border border-slate-100 space-y-4 no-print">
+              <div className="flex justify-between items-center">
+                <h3 className="font-bold text-slate-800 text-sm">
+                  单据类型：
+                  {activeDocType === 'sales' && '📋 销售送货单'}
+                  {activeDocType === 'quote' && '📊 客户报价单'}
+                  {activeDocType === 'contract_vat' && '✒️ 采购合同(增值税专票)'}
+                  {activeDocType === 'contract_normal' && '✒️ 采购合同(普通发票)'}
+                </h3>
+                <button onClick={() => setActiveDocType(null)} className="text-xs text-slate-400 hover:text-slate-600">
+                  关闭并返回 ✕
+                </button>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs text-slate-400 block mb-1">销售公司（乙方）</label>
+                  <input type="text" value={companyName} onChange={e => setCompanyName(e.target.value)} className="w-full bg-slate-50 border-none rounded-xl px-3 py-2 text-xs font-medium text-slate-700" />
+                </div>
+                <div>
+                  <label className="text-xs text-slate-400 block mb-1">购货客户（甲方 - 输入新名自动创建客户）</label>
+                  <input 
+                    type="text" 
+                    value={activeClientName} 
+                    onChange={e => handleSelectClientForDoc(e.target.value)} 
+                    className="w-full bg-slate-50 border-none rounded-xl px-3 py-2 text-xs font-medium text-slate-700" 
+                    placeholder="请输入或选择客户名称"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-slate-400 block mb-1">单据单号</label>
+                  <input type="text" value={documentNo} onChange={e => setDocumentNo(e.target.value)} className="w-full bg-slate-50 border-none rounded-xl px-3 py-2 text-xs font-medium text-slate-700" />
+                </div>
+                <div>
+                  <label className="text-xs text-slate-400 block mb-1">签署日期</label>
+                  <input type="date" value={activeDate} onChange={e => setActiveDate(e.target.value)} className="w-full bg-slate-50 border-none rounded-xl px-3 py-2 text-xs font-medium text-slate-700" />
+                </div>
+              </div>
+
+              {/* 点击添加明细 */}
+              <div>
+                <label className="text-xs font-semibold text-slate-500 block mb-1.5">点击下方物料将其加入送货/报价清单：</label>
+                <div className="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto py-1">
+                  {skus.map(s => (
+                    <button key={s.id} onClick={() => handleAddSkuToDoc(s.id)} className="bg-slate-50 hover:bg-red-50 hover:text-red-500 text-slate-600 text-[11px] px-2.5 py-1 rounded-xl transition-all">
+                      + {s.name}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* 已选明细列表 */}
+              {activeItems.length > 0 && (
+                <div className="space-y-2 mt-2 bg-slate-50/50 p-3 rounded-2xl">
+                  <div className="text-xs font-bold text-slate-600">已选明细：</div>
+                  {activeItems.map((item, index) => {
+                    const originalSku = skus.find(s => s.id === item.skuId);
+                    return (
+                      <div key={index} className="flex justify-between items-center bg-white p-2.5 rounded-xl text-xs shadow-sm">
+                        <span className="font-semibold text-slate-800">{originalSku?.name} ({originalSku?.brand})</span>
+                        <div className="flex space-x-2 items-center">
+                          <input 
+                            type="number" 
+                            className="w-10 text-center bg-slate-50 rounded py-1 font-bold" 
+                            value={item.qty} 
+                            onChange={(e) => {
+                              const updated = [...activeItems];
+                              updated[index].qty = Number(e.target.value);
+                              setActiveItems(updated);
+                            }}
+                          />
+                          <span className="text-slate-400">{originalSku?.unit}</span>
+                          <span>x</span>
+                          <input 
+                            type="number" 
+                            className="w-16 text-center bg-slate-50 rounded py-1 font-bold text-red-500" 
+                            value={item.price} 
+                            onChange={(e) => handleDocPriceChange(index, e.target.value)}
+                          />
+                          <span className="text-slate-400">元</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              <button onClick={triggerPdfPrint} className="w-full bg-red-500 hover:bg-red-600 text-white rounded-2xl py-3 text-xs font-bold active:scale-95 transition-transform shadow-lg shadow-red-100">
+                💾 打印 / 保存为 PDF 文件
+              </button>
+            </div>
+
+            {/* 单据真实预览区 (支持精准打印) */}
+            <div id="print-area" className="print-area bg-white rounded-3xl p-8 shadow-sm border border-slate-100 text-slate-800 space-y-6">
+              
+              {/* 送货单样式 */}
+              {activeDocType === 'sales' && (
+                <div className="space-y-6">
+                  <div className="text-center">
+                    <h1 className="text-xl font-bold tracking-widest">{companyName}</h1>
+                    <p className="text-xs tracking-widest mt-1 text-slate-500">销 售 送 货 单</p>
+                  </div>
+                  <div className="grid grid-cols-2 text-xs text-slate-600">
+                    <div>购货单位：<strong className="text-slate-800">{activeClientName || '(请选择客户)'}</strong></div>
+                    <div className="text-right">单据编号：{documentNo}</div>
+                    <div>送货日期：{activeDate}</div>
+                    <div className="text-right">制单员：{creatorName}</div>
+                  </div>
+                </div>
+              )}
+
+              {/* 报价单样式 */}
+              {activeDocType === 'quote' && (
+                <div className="space-y-6">
+                  <div className="border-b-2 border-slate-800 pb-3">
+                    <h1 className="text-xl font-bold tracking-wider">{companyName}</h1>
+                    <p className="text-[10px] text-slate-500 mt-1">消防安全保障设备优质供应商 ｜ 电话：138-0000-0000</p>
+                  </div>
+                  <div className="flex justify-between items-center">
+                    <h2 className="text-md font-bold">产 品 报 价 报 告</h2>
+                    <span className="text-[10px] text-slate-500">报价日期：{activeDate}</span>
+                  </div>
+                  <p className="text-xs">致：<strong>{activeClientName || '(待定客户)'}</strong></p>
+                </div>
+              )}
+
+              {/* 采购合同（税制细分） */}
+              {(activeDocType === 'contract_vat' || activeDocType === 'contract_normal') && (
+                <div className="space-y-6">
+                  <div className="text-center">
+                    <h1 className="text-md font-bold tracking-widest">消 防 器 材 采 购 合 同 书</h1>
+                    <p className="text-[10px] text-slate-500 mt-1">合同编号：HT-{documentNo}</p>
+                  </div>
+                  <div className="text-xs space-y-1.5">
+                    <p><strong>甲方（采购方）：</strong>{activeClientName || '(待填写)'}</p>
+                    <p><strong>乙方（供应方）：</strong>{companyName}</p>
+                    <p className="text-slate-500 text-[10px]">甲乙双方本着友好互利原则，根据《中华人民共和国民法典》及相关法律法规，一致订立本销售采购合同条款：</p>
+                  </div>
+                </div>
+              )}
+
+              {/* 产品及价格表格 (多模板通用) */}
+              <table className="w-full text-left text-xs border-collapse border border-slate-200">
+                <thead>
+                  <tr className="bg-slate-50 text-[11px] text-slate-600">
+                    <th className="border border-slate-200 p-2 text-center">序号</th>
+                    <th className="border border-slate-200 p-2">物料名称</th>
+                    <th className="border border-slate-200 p-2">品牌规格</th>
+                    <th className="border border-slate-200 p-2 text-center">单位</th>
+                    <th className="border border-slate-200 p-2 text-center">数量</th>
+                    <th className="border border-slate-200 p-2 text-center">协议单价</th>
+                    <th className="border border-slate-200 p-2 text-center">金额(元)</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {activeItems.map((item, index) => {
+                    const originalSku = skus.find(s => s.id === item.skuId);
+                    return (
+                      <tr key={index} className="text-[11px]">
+                        <td className="border border-slate-200 p-2 text-center">{index + 1}</td>
+                        <td className="border border-slate-200 p-2 font-semibold">{originalSku?.name}</td>
+                        <td className="border border-slate-200 p-2 text-slate-500">{originalSku?.brand} {originalSku?.model}</td>
+                        <td className="border border-slate-200 p-2 text-center">{originalSku?.unit}</td>
+                        <td className="border border-slate-200 p-2 text-center">{item.qty}</td>
+                        <td className="border border-slate-200 p-2 text-center">￥{item.price}</td>
+                        <td className="border border-slate-200 p-2 text-center font-bold">￥{item.qty * item.price}</td>
+                      </tr>
+                    );
+                  })}
+                  <tr>
+                    <td colSpan="5" className="border border-slate-200 p-2 text-right font-semibold">合计人民币金额（大写）</td>
+                    <td colSpan="2" className="border border-slate-200 p-2 text-center font-bold text-red-500 text-xs">
+                      ￥{activeItems.reduce((acc, curr) => acc + (curr.qty * curr.price), 0)}
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+
+              {/* 税务发票合规条款 (针对合同专票/普票的核心渲染) */}
+              {activeDocType === 'contract_vat' && (
+                <div className="p-3 bg-slate-50 rounded-xl text-[10px] text-slate-600 leading-relaxed space-y-1">
+                  <p className="font-bold text-slate-800">一、税务发票及合规：</p>
+                  <p>乙方承诺向甲方开具税率为 <strong>13% 的增值税专用发票</strong>，发票品名与合同清单完全一致，并在货款付清后 5 个工作日内寄送。</p>
+                </div>
+              )}
+
+              {activeDocType === 'contract_normal' && (
+                <div className="p-3 bg-slate-50 rounded-xl text-[10px] text-slate-600 leading-relaxed space-y-1">
+                  <p className="font-bold text-slate-800">一、发票及结算：</p>
+                  <p>本合同总价格包含 <strong>普通增值税电子发票 / 不含税费</strong>。甲方验收产品合格后，由乙方提供相应凭证办理结算款手续。</p>
+                </div>
+              )}
+
+              {/* 合同末尾双签 */}
+              {(activeDocType === 'contract_vat' || activeDocType === 'contract_normal') && (
+                <div className="grid grid-cols-2 text-xs pt-8 gap-x-12 leading-relaxed text-slate-600">
+                  <div className="space-y-12">
+                    <p>甲方代表签字 (盖章)：</p>
+                    <p>日期：______年___月___日</p>
+                  </div>
+                  <div className="space-y-12">
+                    <p>乙方代表签字 (盖章)：</p>
+                    <p>日期：______年___月___日</p>
+                  </div>
+                </div>
+              )}
+
+              {/* 送货单双签 */}
+              {activeDocType === 'sales' && (
+                <div className="grid grid-cols-2 text-xs pt-8 text-slate-500">
+                  <div>送货人签字：_______________</div>
+                  <div className="text-right">收货人签字（盖章）：_______________</div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* TAB 2: 客户列表 (完整工商卡片) */}
+        {currentTab === 'clients' && (
+          <div className="space-y-4 no-print">
+            <div className="flex justify-between items-center">
+              <h2 className="font-bold text-slate-800 text-sm">客户工商信息名录 ({clients.length})</h2>
+              <button 
+                onClick={() => setShowAddClientModal(true)}
+                className="text-xs bg-red-500 hover:bg-red-600 text-white font-bold px-4 py-2 rounded-full"
+              >
+                + 添加客户档案
+              </button>
+            </div>
+
+            <div className="space-y-3">
+              {clients.map(client => (
+                <div 
+                  key={client.id}
+                  onClick={() => setSelectedClient(client)}
+                  className="bg-white rounded-3xl p-5 shadow-sm border border-slate-100 hover:border-slate-200 transition-all cursor-pointer relative overflow-hidden"
+                >
+                  <div className="flex justify-between items-start border-b border-slate-50 pb-3">
+                    <div>
+                      <h3 className="font-bold text-slate-800 text-sm">{client.name}</h3>
+                      <span className="text-[10px] text-slate-400 mt-1 block">联系人: {client.contact || '未填写'} ｜ 电话: {client.phone || '未填写'}</span>
+                    </div>
+                    <span className="bg-red-50 text-red-500 font-bold scale-90 px-2 py-0.5 rounded text-[9px]">
+                      已录专属价: {Object.keys(client.skuPrices || {}).length}
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 pt-3 text-[10px] text-slate-500">
+                    <div>公司名称: {client.company || '未填写'}</div>
+                    <div>纳税人识别号: {client.taxId || '未填写'}</div>
+                    <div className="col-span-2">公户账号: {client.bankAccount || '未填写'} ｜ 开户行: {client.bankName || '未填写'}</div>
+                    <div className="col-span-2 text-slate-400">联系地址: {client.address || '未填写'}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* TAB 3: 备份中心 (Google Sheet 的方式) */}
+        {currentTab === 'backup' && (
+          <div className="space-y-4 no-print animate-fade-in">
+            <div className="bg-white rounded-3xl p-6 shadow-sm border border-slate-100 space-y-6">
+              <div className="flex items-start space-x-3">
+                <span className="text-2xl">☁️</span>
+                <div>
+                  <h2 className="text-lg font-bold text-slate-800">Google Sheet 云端备份中心</h2>
+                  <p className="text-xs text-slate-500 mt-1">
+                    支持将 CRM 的 SKU 进价、客户多项工商卡片及专属优惠价全部备份至您的谷歌表格中。
+                  </p>
+                </div>
+              </div>
+
+              <div className="space-y-4">
+                {/* Google Sheet URL 配置 */}
+                <div>
+                  <label className="text-xs font-semibold text-slate-600 block mb-1.5">Google Sheet Web App URL</label>
+                  <input 
+                    type="text" 
+                    value={googleSheetUrl} 
+                    onChange={(e) => {
+                      setGoogleSheetUrl(e.target.value);
+                      localStorage.setItem('crm_gsheet_url', e.target.value);
+                    }}
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-xs focus:ring-1 focus:ring-red-400 outline-none font-mono" 
+                    placeholder="https://script.google.com/macros/s/..."
+                  />
+                  <span className="text-[9px] text-slate-400 mt-1 block">登录您的账号后，该 URL 链接将被【自动记忆】，更换设备只需登录账号即可免输入下载数据。</span>
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="bg-slate-50 p-3.5 rounded-2xl text-center border border-slate-100">
+                    <div className="text-[10px] text-slate-400 font-medium">上次同步状态</div>
+                    <div className="text-xs font-bold text-slate-700 mt-1">{lastSyncTime}</div>
+                  </div>
+                  <div className="bg-slate-50 p-3.5 rounded-2xl text-center border border-slate-100">
+                    <div className="text-[10px] text-slate-400 font-medium">账户登录状态</div>
+                    <div className="text-xs font-bold text-slate-700 mt-1">{user ? '已安全记住配置' : '本地离线状态'}</div>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-3 pt-2">
+                  <button 
+                    onClick={handlePullFromSheet}
+                    className="bg-slate-800 hover:bg-slate-900 text-white font-semibold py-3.5 rounded-2xl text-xs active:scale-95 transition-transform flex flex-col items-center justify-center space-y-1"
+                  >
+                    <span>⬇️</span>
+                    <span>从 Google Sheet 恢复</span>
+                  </button>
+
+                  <button 
+                    onClick={handleBackupToSheet}
+                    className="bg-red-500 hover:bg-red-600 text-white font-semibold py-3.5 rounded-2xl text-xs active:scale-95 transition-transform flex flex-col items-center justify-center space-y-1 shadow-md shadow-red-100"
+                  >
+                    <span>⬆️</span>
+                    <span>同步到 Google Sheet</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+      </main>
+
+      {/* 3. 全局弹窗：新增 SKU */}
+      {showAddSkuModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm no-print">
+          <div className="bg-white rounded-3xl p-6 w-full max-w-md space-y-4 shadow-xl">
+            <div className="flex border-b border-slate-100 pb-2">
+              <button onClick={() => setAddSkuTab('single')} className={`flex-1 text-center py-2 text-xs font-semibold ${addSkuTab === 'single' ? 'text-red-500 border-b-2 border-red-500' : 'text-slate-400'}`}>
+                单个录入
+              </button>
+              <button onClick={() => setAddSkuTab('batch')} className={`flex-1 text-center py-2 text-xs font-semibold ${addSkuTab === 'batch' ? 'text-red-500 border-b-2 border-red-500' : 'text-slate-400'}`}>
+                批量导入表格
+              </button>
+            </div>
+
+            {addSkuTab === 'single' && (
+              <div className="space-y-2 text-xs">
+                <input type="text" placeholder="产品名称" id="add-name" className="w-full bg-slate-50 border-none rounded-xl px-3.5 py-2.5" />
+                <input type="number" placeholder="原生成本进货单价" id="add-price" className="w-full bg-slate-50 border-none rounded-xl px-3.5 py-2.5" />
+                <input type="text" placeholder="生产品牌" id="add-brand" className="w-full bg-slate-50 border-none rounded-xl px-3.5 py-2.5" />
+                <input type="text" placeholder="规格型号" id="add-model" className="w-full bg-slate-50 border-none rounded-xl px-3.5 py-2.5" />
+                <input type="text" placeholder="计量单位" id="add-unit" className="w-full bg-slate-50 border-none rounded-xl px-3.5 py-2.5" />
+                <textarea placeholder="备注说明" id="add-note" className="w-full bg-slate-50 border-none rounded-xl px-3.5 py-2.5 h-16 resize-none" />
+                
+                <div className="flex space-x-2 pt-2">
+                  <button onClick={() => setShowAddSkuModal(false)} className="flex-1 bg-slate-100 text-slate-700 rounded-xl py-2.5 text-xs font-semibold">取消</button>
+                  <button onClick={() => {
+                    const name = document.getElementById('add-name').value;
+                    const price = document.getElementById('add-price').value;
+                    const brand = document.getElementById('add-brand').value;
+                    const model = document.getElementById('add-model').value;
+                    const unit = document.getElementById('add-unit').value || '个';
+                    const note = document.getElementById('add-note').value;
+                    if (!name) return showToast("名称不能为空");
+                    handleAddSku({ name, price, brand, model, unit, note });
+                    setShowAddSkuModal(false);
+                  }} className="flex-1 bg-red-500 text-white rounded-xl py-2.5 text-xs font-semibold">确定新增</button>
+                </div>
+              </div>
+            )}
+
+            {addSkuTab === 'batch' && (
+              <div className="space-y-4">
+                <div>
+                  <label className="text-xs font-semibold text-slate-600 block mb-1.5">导入 CSV 表格</label>
+                  <div className="relative border border-dashed border-slate-300 rounded-xl p-4 text-center hover:bg-slate-50 cursor-pointer">
+                    <input type="file" accept=".csv" onChange={handleCsvImport} className="absolute inset-0 opacity-0 cursor-pointer" />
+                    <div className="text-xs text-slate-500">📂 点击或拖拽 CSV 格式文件</div>
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-xs font-semibold text-slate-600 block mb-1">或直接粘贴 Excel 列数据</label>
+                  <textarea value={batchPasteText} onChange={(e) => setBatchPasteText(e.target.value)} placeholder="名称,进价,品牌,型号,单位,备注 (直接复制多列并粘贴)..." className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3.5 py-2.5 text-xs h-32 outline-none" />
+                  <div className="flex space-x-2">
+                    <button onClick={() => setShowAddSkuModal(false)} className="flex-1 bg-slate-100 text-slate-700 rounded-xl py-2.5 text-xs font-semibold">取消</button>
+                    <button onClick={handleBatchTextImport} className="flex-1 bg-red-500 text-white rounded-xl py-2.5 text-xs font-semibold">执行批量导入</button>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* 4. 全局弹窗：单个 SKU 查看/编辑 */}
+      {selectedSku && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm no-print">
+          <div className="bg-white rounded-3xl p-6 w-full max-w-sm space-y-4 shadow-xl">
+            <h3 className="font-bold text-slate-800">编辑 SKU 规格数据</h3>
+            <div className="space-y-2 text-xs">
+              <input type="text" defaultValue={selectedSku.name} id="edit-name" placeholder="产品名称" className="w-full bg-slate-50 border-none rounded-xl px-3.5 py-2.5" />
+              <input type="number" defaultValue={selectedSku.price} id="edit-price" placeholder="进货底价" className="w-full bg-slate-50 border-none rounded-xl px-3.5 py-2.5" />
+              <input type="text" defaultValue={selectedSku.brand} id="edit-brand" placeholder="生产品牌" className="w-full bg-slate-50 border-none rounded-xl px-3.5 py-2.5" />
+              <input type="text" defaultValue={selectedSku.model} id="edit-model" placeholder="规格型号" className="w-full bg-slate-50 border-none rounded-xl px-3.5 py-2.5" />
+              <input type="text" defaultValue={selectedSku.unit} id="edit-unit" placeholder="单位" className="w-full bg-slate-50 border-none rounded-xl px-3.5 py-2.5" />
+              <textarea defaultValue={selectedSku.note} id="edit-note" placeholder="备注说明" className="w-full bg-slate-50 border-none rounded-xl px-3.5 py-2.5 h-16 resize-none" />
+            </div>
+            <div className="flex space-x-2">
+              <button onClick={() => { handleDeleteSku(selectedSku.id); setSelectedSku(null); }} className="bg-red-50 text-red-500 rounded-xl px-3.5 text-xs font-semibold">删除</button>
+              <button onClick={() => setSelectedSku(null)} className="flex-1 bg-slate-100 text-slate-700 rounded-xl py-2.5 text-xs font-semibold">取消</button>
+              <button onClick={() => {
+                const name = document.getElementById('edit-name').value;
+                const price = document.getElementById('edit-price').value;
+                const brand = document.getElementById('edit-brand').value;
+                const model = document.getElementById('edit-model').value;
+                const unit = document.getElementById('edit-unit').value;
+                const note = document.getElementById('edit-note').value;
+                handleEditSku({ id: selectedSku.id, name, price, brand, model, unit, note });
+                setSelectedSku(null);
+              }} className="flex-1 bg-red-500 text-white rounded-xl py-2.5 text-xs font-semibold">保存修改</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 5. 全局弹窗：新增/查看客户工商档案 */}
+      {showAddClientModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm no-print">
+          <div className="bg-white rounded-3xl p-6 w-full max-w-sm space-y-4 shadow-xl">
+            <h3 className="font-bold text-slate-800">录入新客户档案</h3>
+            <div className="space-y-2 text-xs">
+              <input type="text" placeholder="客户常用简称" id="c-name" className="w-full bg-slate-50 border-none rounded-xl px-3.5 py-2.5" />
+              <input type="text" placeholder="公司工商全称" id="c-comp" className="w-full bg-slate-50 border-none rounded-xl px-3.5 py-2.5" />
+              <input type="text" placeholder="纳税人识别号(税号)" id="c-tax" className="w-full bg-slate-50 border-none rounded-xl px-3.5 py-2.5" />
+              <input type="text" placeholder="联系人" id="c-contact" className="w-full bg-slate-50 border-none rounded-xl px-3.5 py-2.5" />
+              <input type="text" placeholder="电话号码" id="c-phone" className="w-full bg-slate-50 border-none rounded-xl px-3.5 py-2.5" />
+              <input type="text" placeholder="对公银行账号" id="c-acct" className="w-full bg-slate-50 border-none rounded-xl px-3.5 py-2.5" />
+              <input type="text" placeholder="开户行名称" id="c-bank" className="w-full bg-slate-50 border-none rounded-xl px-3.5 py-2.5" />
+              <input type="text" placeholder="联系地址" id="c-addr" className="w-full bg-slate-50 border-none rounded-xl px-3.5 py-2.5" />
+            </div>
+            <div className="flex space-x-2">
+              <button onClick={() => setShowAddClientModal(false)} className="flex-1 bg-slate-100 text-slate-700 rounded-xl py-2.5 text-xs font-semibold">取消</button>
+              <button onClick={() => {
+                const name = document.getElementById('c-name').value;
+                const company = document.getElementById('c-comp').value;
+                const taxId = document.getElementById('c-tax').value;
+                const contact = document.getElementById('c-contact').value;
+                const phone = document.getElementById('c-phone').value;
+                const bankAccount = document.getElementById('c-acct').value;
+                const bankName = document.getElementById('c-bank').value;
+                const address = document.getElementById('c-addr').value;
+                if (!name) return showToast("常用简称不能为空");
+                handleAddClient({ name, company, taxId, contact, phone, bankAccount, bankName, address });
+                setShowAddClientModal(false);
+              }} className="flex-1 bg-red-500 text-white rounded-xl py-2.5 text-xs font-semibold">确定创建</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 6. 全局弹窗：客户卡片详情及专属价格调价面板 */}
+      {selectedClient && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm no-print">
+          <div className="bg-white rounded-3xl p-6 w-full max-w-md space-y-4 shadow-xl">
+            <h3 className="font-bold text-slate-800">编辑客户工商信息</h3>
+            <div className="space-y-2 text-xs max-h-72 overflow-y-auto pr-1">
+              <div>
+                <label className="text-[10px] text-slate-400 block mb-0.5">常用简称</label>
+                <input type="text" defaultValue={selectedClient.name} id="ec-name" className="w-full bg-slate-50 border-none rounded-xl px-3 py-2" />
+              </div>
+              <div>
+                <label className="text-[10px] text-slate-400 block mb-0.5">公司工商全称</label>
+                <input type="text" defaultValue={selectedClient.company} id="ec-comp" className="w-full bg-slate-50 border-none rounded-xl px-3 py-2" />
+              </div>
+              <div>
+                <label className="text-[10px] text-slate-400 block mb-0.5">纳税人识别号(税号)</label>
+                <input type="text" defaultValue={selectedClient.taxId} id="ec-tax" className="w-full bg-slate-50 border-none rounded-xl px-3 py-2" />
+              </div>
+              <div>
+                <label className="text-[10px] text-slate-400 block mb-0.5">联系人</label>
+                <input type="text" defaultValue={selectedClient.contact} id="ec-contact" className="w-full bg-slate-50 border-none rounded-xl px-3 py-2" />
+              </div>
+              <div>
+                <label className="text-[10px] text-slate-400 block mb-0.5">电话号码</label>
+                <input type="text" defaultValue={selectedClient.phone} id="ec-phone" className="w-full bg-slate-50 border-none rounded-xl px-3 py-2" />
+              </div>
+              <div>
+                <label className="text-[10px] text-slate-400 block mb-0.5">公户账号</label>
+                <input type="text" defaultValue={selectedClient.bankAccount} id="ec-acct" className="w-full bg-slate-50 border-none rounded-xl px-3 py-2" />
+              </div>
+              <div>
+                <label className="text-[10px] text-slate-400 block mb-0.5">开户行</label>
+                <input type="text" defaultValue={selectedClient.bankName} id="ec-bank" className="w-full bg-slate-50 border-none rounded-xl px-3 py-2" />
+              </div>
+              <div>
+                <label className="text-[10px] text-slate-400 block mb-0.5">联系地址</label>
+                <input type="text" defaultValue={selectedClient.address} id="ec-addr" className="w-full bg-slate-50 border-none rounded-xl px-3 py-2" />
+              </div>
+
+              {/* 该客户专用的 SKU 优惠价格查阅、手动删除或修改 */}
+              <div className="pt-3 border-t">
+                <span className="text-[10px] font-bold text-red-500 block mb-2">已绑定专属客户售价：</span>
+                {Object.keys(selectedClient.skuPrices || {}).length === 0 ? (
+                  <p className="text-[10px] text-slate-400 py-2">暂无该客户专属价格，将在新销售单中首次成交时自动记住。</p>
+                ) : (
+                  <div className="space-y-1.5">
+                    {Object.entries(selectedClient.skuPrices).map(([sId, price]) => {
+                      const sku = skus.find(s => s.id === sId);
+                      return (
+                        <div key={sId} className="flex justify-between items-center bg-slate-50 p-2 rounded-xl">
+                          <span className="text-[11px] font-medium">{sku?.name || '未知物料'}</span>
+                          <div className="flex space-x-1 items-center">
+                            <input 
+                              type="number" 
+                              defaultValue={price} 
+                              onBlur={(e) => {
+                                const newP = Number(e.target.value) || 0;
+                                setClients(prev => prev.map(c => {
+                                  if (c.id === selectedClient.id) {
+                                    return {
+                                      ...c,
+                                      skuPrices: { ...c.skuPrices, [sId]: newP }
+                                    };
+                                  }
+                                  return c;
+                                }));
+                              }}
+                              className="w-16 text-center bg-white border rounded px-1 text-red-500 font-bold"
+                            />
+                            <span>元</span>
+                            <button 
+                              onClick={() => {
+                                const updatedPrices = { ...selectedClient.skuPrices };
+                                delete updatedPrices[sId];
+                                setClients(prev => prev.map(c => {
+                                  if (c.id === selectedClient.id) {
+                                    return { ...c, skuPrices: updatedPrices };
+                                  }
+                                  return c;
+                                }));
+                                setSelectedClient(null);
+                              }}
+                              className="text-[9px] bg-red-50 text-red-500 rounded p-1"
+                            >
+                              清除
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="flex space-x-2">
+              <button onClick={() => { handleDeleteClient(selectedClient.id); setSelectedClient(null); }} className="bg-red-50 text-red-500 rounded-xl px-3.5 text-xs font-semibold">注销客户</button>
+              <button onClick={() => setSelectedClient(null)} className="flex-1 bg-slate-100 text-slate-700 rounded-xl py-2.5 text-xs font-semibold">取消</button>
+              <button onClick={() => {
+                const name = document.getElementById('ec-name').value;
+                const company = document.getElementById('ec-comp').value;
+                const taxId = document.getElementById('ec-tax').value;
+                const contact = document.getElementById('ec-contact').value;
+                const phone = document.getElementById('ec-phone').value;
+                const bankAccount = document.getElementById('ec-acct').value;
+                const bankName = document.getElementById('ec-bank').value;
+                const address = document.getElementById('ec-addr').value;
+                handleEditClient({ id: selectedClient.id, name, company, taxId, contact, phone, bankAccount, bankName, address, skuPrices: selectedClient.skuPrices });
+                setSelectedClient(null);
+              }} className="flex-1 bg-red-500 text-white rounded-xl py-2.5 text-xs font-semibold">保存</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 7. 全局弹窗：账号注册与登录中心（记忆链接同步） */}
+      {showAuthModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm no-print">
+          <div className="bg-white rounded-3xl p-6 w-full max-w-sm space-y-4 shadow-xl">
+            <h3 className="font-bold text-slate-800">Firebase 用户保护中心</h3>
+            {user ? (
+              <div className="space-y-4 text-xs">
+                <div className="bg-slate-50 p-3 rounded-xl">
+                  <p className="text-slate-400">当前已登录绑定账号</p>
+                  <p className="font-bold text-slate-700 mt-1">{user.email}</p>
+                </div>
+                <p className="text-[10px] text-slate-400">在此登录后，您的 Google Sheet URL 备份配置已自动由系统记住保护。即使在其他手机登录，也可免去再次输入的繁琐。</p>
+                <div className="flex space-x-2">
+                  <button onClick={() => setShowAuthModal(false)} className="flex-1 bg-slate-100 text-slate-700 rounded-xl py-2.5 text-xs font-semibold">关闭窗口</button>
+                  <button onClick={() => { signOut(auth); setShowAuthModal(false); }} className="flex-1 bg-red-500 text-white rounded-xl py-2.5 text-xs font-semibold">退出账号</button>
+                </div>
+              </div>
+            ) : (
+              <form onSubmit={handleAuthSubmit} className="space-y-3">
+                <div className="p-3 bg-red-50/50 rounded-2xl border border-red-100 text-[10px] text-red-600/90 leading-relaxed">
+                  提示：通过该账号登录后，系统会自动**跨设备同步记住**您的 Google Sheet 备份接口 URL，便于新设备一键还原导入数据库 [1]。
+                </div>
+                <input type="email" required placeholder="注册/登录邮箱地址" value={authEmail} onChange={(e) => setAuthEmail(e.target.value)} className="w-full bg-slate-50 border-none rounded-xl px-3.5 py-2.5 text-xs" />
+                <input type="password" required placeholder="账户密码 (不小于6位)" value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} className="w-full bg-slate-50 border-none rounded-xl px-3.5 py-2.5 text-xs" />
+                <button type="submit" disabled={isCloudSyncing} className="w-full bg-red-500 text-white font-bold rounded-xl py-2.5 text-xs">
+                  {isSignUp ? '开始创建并绑定账户' : '安全登录并载入配置'}
+                </button>
+                <button type="button" onClick={() => setIsSignUp(!isSignUp)} className="w-full text-center text-[10px] text-slate-400 underline">
+                  {isSignUp ? '已有安全账号？去登录' : '没有账号？点此免费注册'}
+                </button>
+                <button type="button" onClick={() => setShowAuthModal(false)} className="w-full text-slate-400 text-[11px] font-semibold pt-1">暂不登录</button>
+              </form>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* 8. 底栏固定高斯模糊导航 (精简为 3 项) */}
+      <nav className="fixed bottom-0 left-0 right-0 z-30 backdrop-blur-md bg-white/75 border-t border-slate-200/50 shadow-[0_-2px_10px_rgba(0,0,0,0.03)] flex justify-around py-3 px-2 no-print safe-bottom">
+        {[
+          { id: 'home', label: '首页库/开单', icon: '⛺' },
+          { id: 'clients', label: '客户工商名录', icon: '👥' },
+          { id: 'backup', label: '备份中心', icon: '☁️' }
+        ].map(tab => (
+          <button 
+            key={tab.id}
+            onClick={() => {
+              setCurrentTab(tab.id);
+              setActiveDocType(null); // 切回时退出开单页面
+            }}
+            className={`flex flex-col items-center space-y-1 py-1 px-3.5 rounded-2xl transition-all ${currentTab === tab.id && !activeDocType ? 'text-red-500 bg-red-50/50' : 'text-slate-400 hover:text-slate-600'}`}
+          >
+            <span className="text-lg">{tab.icon}</span>
+            <span className="text-[10px] font-semibold">{tab.label}</span>
+          </button>
+        ))}
+      </nav>
+
+    </div>
+  );
+}
